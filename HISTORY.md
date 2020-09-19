@@ -1,6 +1,34 @@
 Release History
 ===============
 
+v4.0.1 (2020-05-30)
+-------------------
+- 修复了 IAAA 登录报 500 状态码的问题，详见 [Issue #35](https://github.com/zhongxinghong/PKUAutoElective/issues/35)
+
+v3.0.9 (2020-02-20)
+-------------------
+- 对相传可能出现的莫名其妙退课的情况做了防护，详见 [Issue #30](https://github.com/zhongxinghong/PKUAutoElective/issues/30)
+
+
+v3.0.8 (2020-02-20)
+-------------------
+- 在 elective 两个刷新接口的 headers 中添加了 `Cache-Control: max-age=0`
+- 现在可以为课程定义延迟规则，详见 [Issue #28](https://github.com/zhongxinghong/PKUAutoElective/issues/28)
+- 修改了部分代码风格
+
+
+v3.0.7 (2020-02-18)
+-------------------
+- 现在可以识别出因一学期选多门体育课而收到的来自选课网的错误提示
+- 同一回合中出现多门可选的课，并且低优先级待选的课与高优先级已选的课因为 mutex rules 冲突，那么低优先级的课将会被提前忽略，详见 [Issue #25](https://github.com/zhongxinghong/PKUAutoElective/issues/25)
+
+
+v3.0.6 (2020-02-18)
+-------------------
+- 修正了 `config.ini` 注释中把 `班号` 写成 `课号` 的笔误
+- 选课网有的时候会突然显示某门课的已选人数为 0，而实际选课人数已满，此时会报一个 `Unknown tips` 的异常，现在程序可以对这种情况做出识别
+
+
 v3.0.5 (2020-02-17)
 -------------------
 - 现在通过 `config.ini` 定义的课程列表可以像原来那样保持其在文件中的先后顺序，如果在同一循环中遇到同一列表中有多个课可选，将会按照从上往下的顺序依次提交

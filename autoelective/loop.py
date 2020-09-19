@@ -18,6 +18,7 @@ from .logger import ConsoleLogger, FileLogger
 from .course import Course
 from .captcha import CaptchaRecognizer
 from .parser import get_tables, get_courses, get_courses_with_detail, get_sida
+from .hook import _dump_request
 from .iaaa import IAAAClient
 from .elective import ElectiveClient
 from .const import CAPTCHA_CACHE_DIR
@@ -48,11 +49,13 @@ recognizer = CaptchaRecognizer()
 electivePool = Queue(maxsize=elective_pool_size)
 reloginPool = Queue(maxsize=elective_pool_size)
 
-goals = environ.goals
+goals = environ.goals  # let N = len(goals);
 ignored = environ.ignored
-mutexes = environ.mutexes
+mutexes = np.zeros(0, dtype=np.uint8) # uint8 [N][N];
+delays = np.zeros(0, dtype=np.int) # int [N];
 
 killedElective = ElectiveClient(-1)
+NO_DELAY = -1
 
 
 class _ElectiveNeedsLogin(Exception):
@@ -93,6 +96,9 @@ def run_iaaa_loop():
         try:
 
             iaaa = IAAAClient(timeout=iaaa_timeout) # not reusable
+
+            # request elective's home page to get cookies
+            r = iaaa.oauth_home()
 
             r = iaaa.oauth_login(username, password)
 
@@ -185,29 +191,40 @@ def run_elective_loop():
     ## load courses
 
     cs = config.courses  # OrderedDict
-
-    ixd = {} # { cid: cix }
+    N = len(cs)
+    cid_cix = {} # { cid: cix }
 
     for ix, (cid, c) in enumerate(cs.items()):
         goals.append(c)
-        ixd[cid] = ix
+        cid_cix[cid] = ix
 
     ## load mutex
 
     ms = config.mutexes
-
-    N = len(cs)
     mutexes.resize((N, N), refcheck=False)
 
-    for mid, cids in ms.items():
+    for mid, m in ms.items():
         ixs = []
-        for cid in cids:
+        for cid in m.cids:
             if cid not in cs:
-                raise UserInputException("In mutex:%s, course %r is not defined." % (mid, cid))
-            ix = ixd[cid]
+                raise UserInputException("In 'mutex:%s', course %r is not defined" % (mid, cid))
+            ix = cid_cix[cid]
             ixs.append(ix)
         for ix1, ix2 in combinations(ixs, 2):
             mutexes[ix1, ix2] = mutexes[ix2, ix1] = 1
+
+    ## load delay
+
+    ds = config.delays
+    delays.resize(N, refcheck=False)
+    delays.fill(NO_DELAY)
+
+    for did, d in ds.items():
+        cid = d.cid
+        if cid not in cs:
+            raise UserInputException("In 'delay:%s', course %r is not defined" % (did, cid))
+        ix = cid_cix[cid]
+        delays[ix] = d.threshold
 
     ## setup elective pool
 
@@ -236,11 +253,12 @@ def run_elective_loop():
         cout.info("======== Loop %d ========" % environ.elective_loop)
         cout.info("")
 
+        line = "-" * 30
+
         ## print current plans
 
         current = [ c for c in goals if c not in ignored ]
         if len(current) > 0:
-            line = "-" * 30
             cout.info("> Current tasks")
             cout.info(line)
             for ix, course in enumerate(current):
@@ -251,7 +269,6 @@ def run_elective_loop():
         ## print ignored course
 
         if len(ignored) > 0:
-            line = "-" * 30
             cout.info("> Ignored tasks")
             cout.info(line)
             for ix, (course, reason) in enumerate(ignored.items()):
@@ -261,13 +278,23 @@ def run_elective_loop():
 
         ## print mutex rules
 
-        if mutexes.sum() > 0:
-            line = "-" * 30
+        if np.any(mutexes):
             cout.info("> Mutex rules")
             cout.info(line)
             ixs = [ (ix1, ix2) for ix1, ix2 in np.argwhere( mutexes == 1 ) if ix1 < ix2 ]
             for ix, (ix1, ix2) in enumerate(ixs):
                 cout.info("%02d. %s --x-- %s" % (ix + 1, goals[ix1], goals[ix2]))
+            cout.info(line)
+            cout.info("")
+
+        ## print delay rules
+
+        if np.any( delays != NO_DELAY ):
+            cout.info("> Delay rules")
+            cout.info(line)
+            ds = [ (cix, threshold) for cix, threshold in enumerate(delays) if threshold != NO_DELAY ]
+            for ix, (cix, threshold) in enumerate(ds):
+                cout.info("%02d. %s --- %d" % (ix + 1, goals[cix], threshold))
             cout.info(line)
             cout.info("")
 
@@ -289,11 +316,13 @@ def run_elective_loop():
 
             ## check supply/cancel page
 
+            page_r = None
+
             if page == 1:
 
                 cout.info("Get SupplyCancel page %s" % page)
 
-                r = elective.get_SupplyCancel()
+                r = page_r = elective.get_SupplyCancel()
                 tables = get_tables(r._tree)
                 elected = get_courses(tables[1])
                 plans = get_courses_with_detail(tables[0])
@@ -318,7 +347,7 @@ def run_elective_loop():
                         raise OperationFailedError(msg="unable to get normal Supplement page %s" % page)
 
                     cout.info("Get Supplement page %s" % page)
-                    r = elective.get_supplement(page=page) # 双学位第二页
+                    r = page_r = elective.get_supplement(page=page) # 双学位第二页
                     tables = get_tables(r._tree)
                     try:
                         elected = get_courses(tables[1])
@@ -336,7 +365,7 @@ def run_elective_loop():
 
             cout.info("Get available courses")
 
-            tasks = deque()
+            tasks = [] # [(ix, course)]
             for ix, c in enumerate(goals):
                 if c in ignored:
                     continue
@@ -347,17 +376,23 @@ def run_elective_loop():
                         mc = goals[mix]
                         if mc in ignored:
                             continue
-                        cout.info("%s is simultaneously ignored by user customed mutex rules" % mc)
+                        cout.info("%s is simultaneously ignored by mutex rules" % mc)
                         _ignore_course(mc, "Mutex rules")
                 else:
                     for c0 in plans: # c0 has detail
                         if c0 == c:
                             if c0.is_available():
-                                tasks.append(c0)
-                                cout.info("%s is AVAILABLE now !" % c0)
+                                delay = delays[ix]
+                                if delay != NO_DELAY and c0.remaining_quota > delay:
+                                    cout.info("%s hasn't reached the delay threshold %d, skip" % (c0, delay))
+                                else:
+                                    tasks.append((ix, c0))
+                                    cout.info("%s is AVAILABLE now !" % c0)
                             break
                     else:
                         raise UserInputException("%s is not in your course plan, please check your config." % c)
+
+            tasks = deque([ (ix, c) for ix, c in tasks if c not in ignored ]) # filter again and change to deque
 
             ## elect available courses
 
@@ -365,9 +400,27 @@ def run_elective_loop():
                 cout.info("No course available")
                 continue
 
+            elected = []  # cache elected courses dynamically from `get_ElectSupplement`
+
             while len(tasks) > 0:
 
-                course = tasks.popleft()
+                ix, course = tasks.popleft()
+
+                is_mutex = False
+
+                # dynamically filter course by mutex rules
+                for (mix, ) in np.argwhere( mutexes[ix,:] == 1 ):
+                    mc = goals[mix]
+                    if mc in elected: # ignore course in advanced
+                        is_mutex = True
+                        cout.info("%s --x-- %s" % (course, mc))
+                        cout.info("%s is ignored by mutex rules in advance" % course)
+                        _ignore_course(course, "Mutex rules")
+                        break
+
+                if is_mutex:
+                    continue
+
                 cout.info("Try to elect %s" % course)
 
                 ## validate captcha first
@@ -434,9 +487,9 @@ def run_elective_loop():
                     _ignore_course(course, "Credits limited")
                     _add_error(e)
 
-                except MutuallyExclusiveCourseError as e:
+                except MutexCourseError as e:
                     ferr.error(e)
-                    cout.warning("MutuallyExclusiveCourseError encountered")
+                    cout.warning("MutexCourseError encountered")
                     _ignore_course(course, "Mutual exclusive")
                     _add_error(e)
 
@@ -446,14 +499,51 @@ def run_elective_loop():
                     _ignore_course(course, "Multi English course")
                     _add_error(e)
 
-                except ElectionSuccess as e:
-                    cout.info("%s is ELECTED !" % course)
-                    # 不从此处加入 ignored ，而是在下回合根据教学网返回的实际选课结果来决定是否忽略
+                except MultiPECourseError as e:
+                    ferr.error(e)
+                    cout.warning("MultiPECourseError encountered")
+                    _ignore_course(course, "Multi PE course")
+                    _add_error(e)
 
                 except ElectionFailedError as e:
                     ferr.error(e)
                     cout.warning("ElectionFailedError encountered") # 具体原因不明，且不能马上重试
                     _add_error(e)
+
+                except QuotaLimitedError as e:
+                    ferr.error(e)
+                    # 选课网可能会发回异常数据，本身名额 180/180 的课会发 180/0，这个时候选课会得到这个错误
+                    if course.used_quota == 0:
+                        cout.warning("Abnormal status of %s, a bug of 'elective.pku.edu.cn' found" % course)
+                    else:
+                        ferr.critical("Unexcepted behaviour") # 没有理由运行到这里
+                        _add_error(e)
+
+                except ElectionSuccess as e:
+                    # 不从此处加入 ignored，而是在下回合根据教学网返回的实际选课结果来决定是否忽略
+                    cout.info("%s is ELECTED !" % course)
+
+                    # --------------------------------------------------------------------------
+                    # Issue #25
+                    # --------------------------------------------------------------------------
+                    # 但是动态地更新 elected，如果同一回合内有多门课可以被选，并且根据 mutex rules，
+                    # 低优先级的课和刚选上的高优先级课冲突，那么轮到低优先级的课提交选课请求的时候，
+                    # 根据这个动态更新的 elected 它将会被提前地忽略（而不是留到下一循环回合的开始时才被忽略）
+                    # --------------------------------------------------------------------------
+                    r = e.response  # get response from error ... a bit ugly
+                    tables = get_tables(r._tree)
+                    # use clear() + extend() instead of op `=` to ensure `id(elected)` doesn't change
+                    elected.clear()
+                    elected.extend(get_courses(tables[1]))
+
+                except RuntimeError as e:
+                    ferr.critical(e)
+                    ferr.critical("RuntimeError with Course(name=%r, class_no=%d, school=%r, status=%s, href=%r)" % (
+                                    course.name, course.class_no, course.school, course.status, course.href))
+                    # use this private function of 'hook.py' to dump the response from `get_SupplyCancel` or `get_supplement`
+                    file = _dump_request(page_r)
+                    ferr.critical("Dump response from 'get_SupplyCancel / get_supplement' to %s" % file)
+                    raise e
 
                 except Exception as e:
                     raise e  # don't increase error count here

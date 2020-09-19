@@ -162,11 +162,17 @@ def check_elective_tips(r, **kwargs):
         elif tips.startswith("该课程在补退选阶段开始后的约一周开放选课"): # 这个可能需要根据当学期情况进行修改
             raise ElectionPermissionError(response=r, msg=tips)
 
+        elif tips.startswith("该课程选课人数已满"):
+            raise QuotaLimitedError(response=r, msg=tips)
+
+        elif tips.startswith("学校规定每学期只能修一门体育课"):
+            raise MultiPECourseError(response=r, msg=tips)
+
         elif _regexElectionSuccess.search(tips):
             raise ElectionSuccess(response=r, msg=tips)
 
         elif _regexMutex.search(tips):
-            raise MutuallyExclusiveCourseError(response=r, msg=tips)
+            raise MutexCourseError(response=r, msg=tips)
 
         else:
             cout.warning("Unknown tips: %s" % tips)
@@ -193,10 +199,7 @@ def debug_print_request(r, **kwargs):
     cout.debug("")
 
 
-def debug_dump_request(r, **kwargs):
-    if not config.is_debug_dump_request:
-        return
-
+def _dump_request(r):
     if "_client" in r.request.__dict__:  # _client will be set by BaseClient
         client = r.request._client
         r.request._client = None  # don't save client object
@@ -209,10 +212,18 @@ def debug_dump_request(r, **kwargs):
     filename = "%s.%s.gz" % (timestamp, basename)  # put timestamp first
     file = os.path.normpath(os.path.abspath(os.path.join(_USER_REQUEST_LOG_DIR, filename)))
 
-    cout.debug("Dump request %s to %s" % (r.url, file))
     pickle_gzip_dump(r, file)
 
     # restore objects defined by autoelective package
     if "_client" in r.request.__dict__:
         r.request._client = client
     r.request.hooks = hooks
+
+    return file
+
+
+def debug_dump_request(r, **kwargs):
+    if not config.is_debug_dump_request:
+        return
+    file = _dump_request(r)
+    cout.debug("Dump request %s to %s" % (r.url, file))
